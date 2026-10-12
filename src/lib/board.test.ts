@@ -8,7 +8,7 @@ const save = (state = createSeed(), input: Partial<BookmarkInput> = {}) =>
     type: 'bookmark/save',
     id: 'b1',
     now: 1,
-    input: { sectionId: 'wedding-s1', title: '', url: 'example.com', note: '', imageUrl: '', ...input },
+    input: { sectionId: 'wedding-s1', title: '', url: 'example.com', description: '', imageUrl: '', ...input },
   });
 
 describe('normalizeUrl', () => {

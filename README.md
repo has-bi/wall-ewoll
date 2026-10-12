@@ -27,11 +27,31 @@ npm test                     # reducer, URL validation, SQL (in-process Postgres
 
 ## Features
 
-- Category tabs (URL hash routing, e.g. `#/cafe`, so refresh and shared links keep the tab)
-- Add / rename / reorder / delete sections per category
-- Add / edit / delete bookmarks (link, title, note, optional cover image), move between sections
-- Search inside the current category, section jump chips
-- Export / import a JSON backup
+- Category tabs (Wedding, Cafe), sections as tabs inside each category, masonry card grid, floating "+" on mobile
+- Every bookmark is normalised to **thumbnail + title + short description** (clamped with "…"),
+  whatever the link is: Instagram, Threads, Facebook, TikTok, X/Twitter, YouTube, Google Maps or any article
+- Paste a link and the card fills itself in; every field can still be edited by hand
+- Links without an image get a brand-colour tile naming the source
+- Add / rename / reorder / delete sections; search; JSON export/import; "Fill missing previews" for older bookmarks
+
+## How link previews work
+
+`POST /api/preview` (needs the edit key) reads the link on the server:
+
+| Source | How |
+|---|---|
+| TikTok | official oEmbed (`tiktok.com/oembed`) |
+| X / Twitter | the embed widget's syndication endpoint (`cdn.syndication.twimg.com`) |
+| Instagram, Threads, Facebook | Open Graph tags fetched as Meta's link-preview crawler, captions cleaned of "1,204 likes, 31 comments - …" |
+| Everything else | Open Graph / Twitter-card / `<title>` tags |
+
+Title = who posted it (social) or the page title (articles); description = caption or meta description.
+On save, the server downloads the image, re-encodes it to a ≤720px WebP and stores it in the `thumbnails`
+table, served from `/api/thumb`. Platform image URLs (Instagram, TikTok, X) are signed and expire within days,
+so cards never depend on them. All server fetches block private/internal addresses, cap size and time out.
+
+Instagram in particular may refuse logged-out requests from datacenter IPs now and then; when a link
+can't be read the card still saves, with a fallback tile, and "Refresh from link" can retry later.
 
 ## How data is stored
 
@@ -52,7 +72,12 @@ so a saved card can never run `javascript:` code.
 
 ```
 api/board.ts             Vercel Function: GET board, POST action (auth)
+api/preview.ts           read title/description/image from a link (auth)
+api/thumb.ts             serve cached thumbnails
 server/db.ts             SQL for every action (Neon serverless driver)
+server/preview.ts        per-platform metadata extraction
+server/thumbs.ts         download + resize images (sharp)
+server/safe-fetch.ts     SSRF-guarded fetch
 db/schema.sql            tables
 scripts/db-setup.ts      migration + seed
 src/
@@ -62,7 +87,8 @@ src/
   lib/storage.ts         browser cache, legacy data, export/import
   lib/seed.ts            default categories and sections
   lib/url.ts             URL normalising
-  components/            SectionBlock, BookmarkCard, dialogs, hero illustration
+  lib/platform.ts        detect Instagram/TikTok/X/… from a URL
+  components/            PinCard + Masonry, BookmarkDialog, Modal
   styles/tokens.css      design.md tokens as CSS variables
   styles/app.css         component styles
 ```

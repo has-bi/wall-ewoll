@@ -2,13 +2,12 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import type { BoardState, Bookmark, Section } from './types';
 import { boardReducer, newId, type Action } from './lib/board';
 import { cacheBoard, clearLegacyBoard, exportBoard, loadCachedBoard, loadLegacyBoard, readBoardFile } from './lib/storage';
-import { fetchBoard, getEditKey, sendAction, setEditKey, UnauthorizedError } from './lib/api';
+import { fetchBoard, fetchPreview, getEditKey, sendAction, setEditKey, UnauthorizedError } from './lib/api';
 import { hostnameOf } from './lib/url';
-import { SectionBlock } from './components/SectionBlock';
 import { BookmarkDialog } from './components/BookmarkDialog';
-import { HeroArt } from './components/HeroArt';
+import { Masonry, PinCard } from './components/PinCard';
 import { Modal } from './components/Modal';
-import { Icon } from './components/Icon';
+import { Icon, type IconName } from './components/Icon';
 
 type DialogState =
   | { kind: 'none' }
@@ -16,11 +15,20 @@ type DialogState =
   | { kind: 'section'; section?: Section }
   | { kind: 'delete-section'; section: Section; count: number }
   | { kind: 'delete-bookmark'; bookmark: Bookmark }
-  | { kind: 'edit-key'; pending: Action; onSuccess?: () => void; error: string };
+  /** `then` runs once a key has been entered: a retried save, or opening the add dialog. */
+  | { kind: 'edit-key'; then: () => void; error: string };
 
 type SyncStatus = 'loading' | 'online' | 'offline';
 
-const categoryFromHash = () => decodeURIComponent(window.location.hash.replace(/^#\/?/, ''));
+// Routes: #/<categoryId> or #/<categoryId>/<sectionId>
+const readHash = () => {
+  const [categoryId = '', sectionId = ''] = window.location.hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
+  return { categoryId, sectionId };
+};
+const hrefFor = (categoryId: string, sectionId?: string) =>
+  `#/${encodeURIComponent(categoryId)}${sectionId ? `/${encodeURIComponent(sectionId)}` : ''}`;
+
+const CATEGORY_ICONS: Record<string, IconName> = { wedding: 'ring', cafe: 'cup' };
 
 export default function App() {
   const [board, dispatch] = useReducer(boardReducer, undefined, loadCachedBoard);
@@ -28,11 +36,13 @@ export default function App() {
   const [hasKey, setHasKey] = useState(() => !!getEditKey());
   const [keyDraft, setKeyDraft] = useState('');
   const [legacy, setLegacy] = useState<BoardState | null>(loadLegacyBoard);
-  const [categoryId, setCategoryId] = useState(() => categoryFromHash());
+  const [route, setRoute] = useState(readHash);
   const [query, setQuery] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [sectionName, setSectionName] = useState('');
   const [notice, setNotice] = useState('');
+  const [bulk, setBulk] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => cacheBoard(board), [board]);
@@ -51,36 +61,45 @@ export default function App() {
   }, [refresh]);
 
   useEffect(() => {
-    const onHash = () => setCategoryId(categoryFromHash());
+    const onHash = () => setRoute(readHash());
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
 
-  const category = board.categories.find((c) => c.id === categoryId) ?? board.categories[0];
+  const category = board.categories.find((c) => c.id === route.categoryId) ?? board.categories[0];
   const sections = useMemo(() => board.sections.filter((s) => s.categoryId === category.id), [board.sections, category.id]);
+  const activeSection = sections.find((s) => s.id === route.sectionId);
+  const sectionNames = useMemo(() => new Map(sections.map((s) => [s.id, s.name])), [sections]);
 
   const q = query.trim().toLowerCase();
-  const bookmarksBySection = useMemo(() => {
-    const map = new Map<string, Bookmark[]>(sections.map((s) => [s.id, []]));
-    for (const b of board.bookmarks) {
-      const list = map.get(b.sectionId);
-      if (!list) continue;
-      if (q && ![b.title, b.note, hostnameOf(b.url)].some((t) => t.toLowerCase().includes(q))) continue;
-      list.push(b);
-    }
+  const visible = useMemo(
+    () =>
+      board.bookmarks.filter(
+        (b) =>
+          (activeSection ? b.sectionId === activeSection.id : sectionNames.has(b.sectionId)) &&
+          (!q || [b.title, b.description, hostnameOf(b.url)].some((t) => t.toLowerCase().includes(q))),
+      ),
+    [board.bookmarks, activeSection, sectionNames, q],
+  );
+  const counts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const b of board.bookmarks) map.set(b.sectionId, (map.get(b.sectionId) ?? 0) + 1);
     return map;
-  }, [board.bookmarks, sections, q]);
-  const totalInCategory = board.bookmarks.filter((b) => sections.some((s) => s.id === b.sectionId)).length;
+  }, [board.bookmarks]);
+  const totalInCategory = sections.reduce((n, s) => n + (counts.get(s.id) ?? 0), 0);
+  const missingPreviews = board.bookmarks.filter((b) => !b.thumb).length;
 
   const close = () => setDialog({ kind: 'none' });
-  const openSectionDialog = (section?: Section) => {
-    setSectionName(section?.name ?? '');
-    setDialog({ kind: 'section', section });
-  };
   const flash = (msg: string) => {
     setNotice(msg);
     window.setTimeout(() => setNotice(''), 3000);
   };
+  const askForKey = (then: () => void, error = '') => {
+    setKeyDraft('');
+    setDialog({ kind: 'edit-key', then, error });
+  };
+  /** Runs fn now if this device has an edit key, otherwise after the user enters one. */
+  const requireKey = (fn: () => void) => (getEditKey() ? fn() : askForKey(fn));
 
   /** Applies a change locally right away, then saves it. On failure the board is reloaded from the server. */
   const commit = async (action: Action, onSuccess?: () => void): Promise<void> => {
@@ -94,9 +113,7 @@ export default function App() {
       onSuccess?.();
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        // Retried with the same onSuccess once the user enters the key.
-        setKeyDraft('');
-        setDialog({ kind: 'edit-key', pending: action, onSuccess, error: getEditKey() ? err.message : '' });
+        askForKey(() => void commit(action, onSuccess), getEditKey() ? err.message : '');
       } else {
         flash(err instanceof Error ? err.message : 'Save failed.');
       }
@@ -104,163 +121,220 @@ export default function App() {
     }
   };
 
+  const openSectionDialog = (section?: Section) => {
+    setSectionName(section?.name ?? '');
+    setDialog({ kind: 'section', section });
+  };
+  const openAdd = () => {
+    const sectionId = activeSection?.id ?? sections[0]?.id;
+    if (!sectionId) return openSectionDialog();
+    requireKey(() => setDialog({ kind: 'bookmark', sectionId }));
+  };
+
+  /** Re-reads title/description/thumbnail for bookmarks that have no cached thumbnail yet. */
+  const fillMissing = () =>
+    requireKey(async () => {
+      const todo = board.bookmarks.filter((b) => !b.thumb);
+      let failed = 0;
+      for (const [i, b] of todo.entries()) {
+        setBulk(`Reading links ${i + 1}/${todo.length}…`);
+        try {
+          const p = await fetchPreview(b.url);
+          const keepTitle = b.title && b.title !== hostnameOf(b.url);
+          await sendAction({
+            type: 'bookmark/save',
+            id: b.id,
+            now: b.createdAt,
+            input: {
+              id: b.id,
+              sectionId: b.sectionId,
+              url: b.url,
+              title: keepTitle ? b.title : p.title,
+              description: b.description || p.description,
+              imageUrl: p.image || b.imageUrl,
+            },
+          });
+        } catch (err) {
+          if (err instanceof UnauthorizedError) {
+            setBulk('');
+            return askForKey(fillMissing, err.message);
+          }
+          failed++;
+        }
+      }
+      setBulk('');
+      await refresh();
+      flash(failed ? `Done — ${failed} link${failed === 1 ? '' : 's'} couldn't be read.` : 'Previews updated.');
+    });
+
+  const half = Math.ceil(board.categories.length / 2);
+  const navItem = (c: (typeof board.categories)[number]) => (
+    <a key={c.id} href={hrefFor(c.id)} className={`bottom-nav__item${c.id === category.id ? ' is-active' : ''}`} aria-current={c.id === category.id ? 'page' : undefined}>
+      <Icon name={CATEGORY_ICONS[c.id] ?? 'grid'} size={22} />
+      <span>{c.name}</span>
+    </a>
+  );
+
   return (
     <>
-      <nav className="top-nav">
-        <div className="container top-nav__inner">
-          <a href={`#/${board.categories[0].id}`} className="brand">
+      <header className="app-header">
+        <div className="container app-header__row">
+          <a href={hrefFor(board.categories[0].id)} className="brand" aria-label="Wall Ewoll home">
             <span className="brand__mark" aria-hidden="true" />
-            Wall Ewoll
+            <span className="brand__name">Wall Ewoll</span>
           </a>
-          <div className="tabs" role="tablist" aria-label="Categories">
+          <p className="app-header__title" aria-hidden="true">
+            {category.name}
+          </p>
+          <nav className="cat-pills" aria-label="Categories">
             {board.categories.map((c) => (
-              <a
-                key={c.id}
-                href={`#/${c.id}`}
-                role="tab"
-                aria-selected={c.id === category.id}
-                className={c.id === category.id ? 'category-tab category-tab--active' : 'category-tab'}
-              >
+              <a key={c.id} href={hrefFor(c.id)} className={c.id === category.id ? 'category-tab category-tab--active' : 'category-tab'} aria-current={c.id === category.id ? 'page' : undefined}>
                 {c.name}
               </a>
             ))}
+          </nav>
+          <div className="app-header__actions">
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => {
+                setSearchOpen((o) => !o);
+                if (searchOpen) setQuery('');
+              }}
+              aria-label={searchOpen ? 'Close search' : 'Search'}
+              aria-expanded={searchOpen}
+            >
+              <Icon name={searchOpen ? 'close' : 'search'} />
+            </button>
+            <button type="button" className="btn btn-primary hide-sm" onClick={openAdd}>
+              <Icon name="plus" size={16} /> Add bookmark
+            </button>
           </div>
-          <button
-            type="button"
-            className="btn btn-primary top-nav__cta"
-            disabled={sections.length === 0}
-            onClick={() => setDialog({ kind: 'bookmark', sectionId: sections[0].id })}
-          >
-            <Icon name="plus" size={16} /> <span className="hide-sm">Add bookmark</span>
-          </button>
         </div>
-      </nav>
-
-      <main>
-        <header className="container hero">
-          <div className="hero__copy">
-            <p className="caption-uppercase muted">
-              {sections.length} sections · {totalInCategory} bookmarks
-            </p>
-            <h1 className="display-xl">{category.name}</h1>
-            <p className="title-md hero__lead">{category.tagline}</p>
-            <div className="hero__actions">
-              <button
-                type="button"
-                className="btn btn-primary"
-                disabled={sections.length === 0}
-                onClick={() => setDialog({ kind: 'bookmark', sectionId: sections[0].id })}
-              >
-                Add bookmark
-              </button>
-              <button type="button" className="btn btn-secondary" onClick={() => openSectionDialog()}>
-                New section
-              </button>
-            </div>
-          </div>
-          <HeroArt categoryId={category.id} />
-        </header>
-
-        <div className="container toolbar">
-          <label className="search">
-            <Icon name="search" />
+        {searchOpen && (
+          <div className="container search-row">
             <input
-              className="input search__input"
+              className="input"
               type="search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder={`Search ${category.name.toLowerCase()} bookmarks`}
               aria-label="Search bookmarks"
+              autoFocus
             />
-          </label>
-          <div className="chips" aria-label="Jump to section">
-            {sections.map((s) => (
-              <a key={s.id} href={`#section-${s.id}`} className="badge-pill" onClick={(e) => {
-                // Hash links would change the category route, so scroll manually.
-                e.preventDefault();
-                document.getElementById(`section-${s.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              }}>
-                {s.name} <span className="muted">{bookmarksBySection.get(s.id)?.length ?? 0}</span>
-              </a>
-            ))}
           </div>
+        )}
+      </header>
+
+      <main className="container main">
+        <div className="page-head">
+          <h1 className="display-md">{category.name}</h1>
+          <p className="body-md muted">{category.tagline}</p>
+        </div>
+
+        <nav className="section-tabs" aria-label={`${category.name} sections`}>
+          <a href={hrefFor(category.id)} className={`section-tab${!activeSection ? ' is-active' : ''}`} aria-current={!activeSection ? 'page' : undefined}>
+            All
+          </a>
+          {sections.map((s) => (
+            <a key={s.id} href={hrefFor(category.id, s.id)} className={`section-tab${activeSection?.id === s.id ? ' is-active' : ''}`} aria-current={activeSection?.id === s.id ? 'page' : undefined}>
+              {s.name}
+            </a>
+          ))}
+          <button type="button" className="section-tab section-tab--add" onClick={() => openSectionDialog()} aria-label="New section">
+            <Icon name="plus" size={16} />
+          </button>
+        </nav>
+
+        <div className="section-bar">
+          <p className="caption-uppercase muted">
+            {activeSection
+              ? `${counts.get(activeSection.id) ?? 0} ${(counts.get(activeSection.id) ?? 0) === 1 ? 'link' : 'links'}`
+              : `${totalInCategory} links · ${sections.length} sections`}
+            {q && ` · ${visible.length} match${visible.length === 1 ? '' : 'es'}`}
+          </p>
+          {activeSection && (
+            <div className="section-bar__tools">
+              <button type="button" className="icon-btn" onClick={() => void commit({ type: 'section/move', id: activeSection.id, dir: -1 })} disabled={sections[0]?.id === activeSection.id} aria-label={`Move ${activeSection.name} left`}>
+                <Icon name="left" size={16} />
+              </button>
+              <button type="button" className="icon-btn" onClick={() => void commit({ type: 'section/move', id: activeSection.id, dir: 1 })} disabled={sections.at(-1)?.id === activeSection.id} aria-label={`Move ${activeSection.name} right`}>
+                <Icon name="right" size={16} />
+              </button>
+              <button type="button" className="icon-btn" onClick={() => openSectionDialog(activeSection)} aria-label={`Rename ${activeSection.name}`}>
+                <Icon name="edit" size={16} />
+              </button>
+              <button type="button" className="icon-btn" onClick={() => setDialog({ kind: 'delete-section', section: activeSection, count: counts.get(activeSection.id) ?? 0 })} aria-label={`Delete ${activeSection.name}`}>
+                <Icon name="trash" size={16} />
+              </button>
+            </div>
+          )}
         </div>
 
         {status === 'offline' && (
-          <div className="container">
-            <div className="banner" role="status">
-              <span>Can't reach the server. You're seeing the last saved copy.</span>
-              <button type="button" className="btn btn-on-color" onClick={() => void refresh()}>
-                Retry
-              </button>
-            </div>
+          <div className="banner" role="status">
+            <span>Can't reach the server. You're seeing the last saved copy.</span>
+            <button type="button" className="btn btn-on-color" onClick={() => void refresh()}>
+              Retry
+            </button>
           </div>
         )}
         {legacy && status === 'online' && board.bookmarks.length === 0 && (
-          <div className="container">
-            <div className="banner" role="status">
-              <span>
-                This browser still has {legacy.bookmarks.length} bookmarks from before the database. Move them in?
-              </span>
-              <span className="banner__actions">
-                <button
-                  type="button"
-                  className="btn btn-on-color"
-                  onClick={() =>
-                    void commit({ type: 'board/replace', state: legacy }, () => {
-                      clearLegacyBoard();
-                      setLegacy(null);
-                      flash('Bookmarks moved to the database.');
-                    })
-                  }
-                >
-                  Move them
-                </button>
-                <button
-                  type="button"
-                  className="btn-text-link"
-                  onClick={() => {
+          <div className="banner" role="status">
+            <span>This browser still has {legacy.bookmarks.length} bookmarks from before the database. Move them in?</span>
+            <span className="banner__actions">
+              <button
+                type="button"
+                className="btn btn-on-color"
+                onClick={() =>
+                  void commit({ type: 'board/replace', state: legacy }, () => {
                     clearLegacyBoard();
                     setLegacy(null);
-                  }}
-                >
-                  Discard
-                </button>
-              </span>
-            </div>
+                    flash('Bookmarks moved to the database.');
+                  })
+                }
+              >
+                Move them
+              </button>
+              <button
+                type="button"
+                className="btn-text-link"
+                onClick={() => {
+                  clearLegacyBoard();
+                  setLegacy(null);
+                }}
+              >
+                Discard
+              </button>
+            </span>
           </div>
         )}
 
-        <div className="container sections">
-          {sections.map((s, i) => (
-            <SectionBlock
-              key={s.id}
-              section={s}
-              index={i}
-              total={sections.length}
-              bookmarks={bookmarksBySection.get(s.id) ?? []}
-              filtering={!!q}
-              onAdd={() => setDialog({ kind: 'bookmark', sectionId: s.id })}
-              onRename={() => openSectionDialog(s)}
-              onMove={(dir) => void commit({ type: 'section/move', id: s.id, dir })}
-              onDelete={() =>
-                setDialog({ kind: 'delete-section', section: s, count: board.bookmarks.filter((b) => b.sectionId === s.id).length })
-              }
-              onEditBookmark={(b) => setDialog({ kind: 'bookmark', bookmark: b, sectionId: b.sectionId })}
-              onDeleteBookmark={(b) => setDialog({ kind: 'delete-bookmark', bookmark: b })}
-            />
-          ))}
-
-          <section className="cta-band">
-            <div>
-              <h2 className="display-md">Need another pile?</h2>
-              <p className="body-md muted">Make a section for anything — catering, photographers, cafes with good playlists.</p>
-            </div>
-            <button type="button" className="btn btn-primary" onClick={() => openSectionDialog()}>
-              <Icon name="plus" size={16} /> New section
-            </button>
-          </section>
-        </div>
+        {visible.length > 0 ? (
+          <Masonry
+            items={visible}
+            render={(b) => (
+              <PinCard
+                key={b.id}
+                bookmark={b}
+                sectionName={activeSection ? undefined : sectionNames.get(b.sectionId)}
+                onEdit={() => requireKey(() => setDialog({ kind: 'bookmark', bookmark: b, sectionId: b.sectionId }))}
+              />
+            )}
+          />
+        ) : (
+          <div className="empty-state">
+            <h2 className="display-sm">{q ? 'No matches' : 'Nothing saved here yet'}</h2>
+            <p className="body-md">
+              {q ? 'Try another word.' : 'Paste an Instagram, TikTok, X or any link — the thumbnail, title and description fill in automatically.'}
+            </p>
+            {!q && (
+              <button type="button" className="btn btn-primary" onClick={openAdd}>
+                <Icon name="plus" size={16} /> Add bookmark
+              </button>
+            )}
+          </div>
+        )}
       </main>
 
       <footer className="footer">
@@ -274,6 +348,11 @@ export default function App() {
             </p>
           </div>
           <div className="footer__actions">
+            {missingPreviews > 0 && status === 'online' && (
+              <button type="button" className="btn btn-secondary" onClick={fillMissing} disabled={!!bulk}>
+                <Icon name="refresh" size={16} /> {bulk || `Fill ${missingPreviews} missing preview${missingPreviews === 1 ? '' : 's'}`}
+              </button>
+            )}
             <button type="button" className="btn btn-secondary" onClick={() => exportBoard(board)}>
               Export JSON
             </button>
@@ -313,6 +392,14 @@ export default function App() {
         </div>
       </footer>
 
+      <nav className="bottom-nav" aria-label="Categories">
+        {board.categories.slice(0, half).map(navItem)}
+        <button type="button" className="fab" onClick={openAdd} aria-label="Add bookmark">
+          <Icon name="plus" size={24} />
+        </button>
+        {board.categories.slice(half).map(navItem)}
+      </nav>
+
       {notice && (
         <div className="toast" role="status">
           {notice}
@@ -325,8 +412,10 @@ export default function App() {
           initial={dialog.bookmark}
           defaultSectionId={dialog.sectionId}
           onClose={close}
+          onDelete={dialog.bookmark && (() => setDialog({ kind: 'delete-bookmark', bookmark: dialog.bookmark! }))}
           onSave={(input) => {
-            void commit({ type: 'bookmark/save', input, id: newId(), now: Date.now() });
+            // Refresh afterwards to pick up the thumbnail the server just cached.
+            void commit({ type: 'bookmark/save', input, id: newId(), now: Date.now() }, () => void refresh());
             close();
           }}
         />
@@ -339,8 +428,13 @@ export default function App() {
           submitDisabled={!sectionName.trim()}
           onClose={close}
           onSubmit={() => {
-            if (dialog.section) void commit({ type: 'section/rename', id: dialog.section.id, name: sectionName });
-            else void commit({ type: 'section/add', categoryId: category.id, name: sectionName, id: newId() });
+            if (dialog.section) {
+              void commit({ type: 'section/rename', id: dialog.section.id, name: sectionName });
+            } else {
+              const id = newId();
+              void commit({ type: 'section/add', categoryId: category.id, name: sectionName, id });
+              window.location.hash = hrefFor(category.id, id);
+            }
             close();
           }}
         >
@@ -366,6 +460,7 @@ export default function App() {
           onClose={close}
           onSubmit={() => {
             void commit({ type: 'section/delete', id: dialog.section.id });
+            window.location.hash = hrefFor(category.id);
             close();
           }}
         >
@@ -380,15 +475,15 @@ export default function App() {
       {dialog.kind === 'edit-key' && (
         <Modal
           title="Enter edit key"
-          submitLabel="Unlock & save"
+          submitLabel="Unlock"
           submitDisabled={!keyDraft.trim()}
           onClose={close}
           onSubmit={() => {
             setEditKey(keyDraft.trim());
             setHasKey(true);
-            const { pending, onSuccess } = dialog;
+            const { then } = dialog;
             close();
-            void commit(pending, onSuccess);
+            then();
           }}
         >
           <p className="body-md">

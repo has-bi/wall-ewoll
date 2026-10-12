@@ -8,11 +8,13 @@ interface ModalProps {
   submitLabel: string;
   danger?: boolean;
   submitDisabled?: boolean;
+  /** Rendered at the left of the footer, e.g. a destructive action. */
+  footerStart?: ReactNode;
   children: ReactNode;
 }
 
 /** Native <dialog> gives focus trapping, Esc-to-close and a backdrop for free. */
-export function Modal({ title, onClose, onSubmit, submitLabel, danger, submitDisabled, children }: ModalProps) {
+export function Modal({ title, onClose, onSubmit, submitLabel, danger, submitDisabled, footerStart, children }: ModalProps) {
   const ref = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
@@ -48,6 +50,7 @@ export function Modal({ title, onClose, onSubmit, submitLabel, danger, submitDis
         </header>
         {children}
         <footer className="modal__actions">
+          {footerStart && <div className="modal__actions-start">{footerStart}</div>}
           <button type="button" className="btn btn-secondary" onClick={onClose}>
             Cancel
           </button>

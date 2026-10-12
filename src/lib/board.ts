@@ -1,7 +1,7 @@
 import type { BoardState, Bookmark, Section } from '../types.js';
 import { hostnameOf, normalizeUrl } from './url.js';
 
-export type BookmarkInput = Omit<Bookmark, 'id' | 'createdAt'> & { id?: string };
+export type BookmarkInput = Pick<Bookmark, 'sectionId' | 'title' | 'url' | 'description' | 'imageUrl'> & { id?: string };
 
 export type Action =
   | { type: 'section/add'; categoryId: string; name: string; id: string }
@@ -55,11 +55,14 @@ export function boardReducer(state: BoardState, action: Action): BoardState {
         sectionId: input.sectionId,
         title: input.title.trim() || hostnameOf(url),
         url,
-        note: input.note.trim(),
+        description: input.description.trim(),
         imageUrl: normalizeUrl(input.imageUrl) ?? '',
       };
       if (input.id && state.bookmarks.some((b) => b.id === input.id)) {
-        return { ...state, bookmarks: state.bookmarks.map((b) => (b.id === input.id ? { ...b, ...fields } : b)) };
+        const update = (b: Bookmark): Bookmark =>
+          // The cached thumbnail only stays valid while the image URL is unchanged.
+          ({ ...b, ...fields, thumb: b.imageUrl === fields.imageUrl ? b.thumb : undefined });
+        return { ...state, bookmarks: state.bookmarks.map((b) => (b.id === input.id ? update(b) : b)) };
       }
       // Newest first, so a fresh save shows at the top of its section.
       return { ...state, bookmarks: [{ id: action.id, createdAt: action.now, ...fields }, ...state.bookmarks] };
@@ -98,8 +101,11 @@ export function parseBoard(data: unknown): BoardState | null {
       sectionId: b.sectionId,
       title: isStr(b.title) ? b.title : url,
       url,
-      note: isStr(b.note) ? b.note : '',
+      // Backups from before v2 call the description "note".
+      description: isStr(b.description) ? b.description : isStr(b.note) ? b.note : '',
       imageUrl: isStr(b.imageUrl) ? (normalizeUrl(b.imageUrl) ?? '') : '',
+      // Goes into an /api/thumb URL, so only accept the hex token the server generates.
+      ...(isStr(b.thumb) && /^[a-f0-9]{1,32}$/.test(b.thumb) ? { thumb: b.thumb } : {}),
       createdAt: typeof b.createdAt === 'number' ? b.createdAt : 0,
     });
   }

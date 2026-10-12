@@ -39,3 +39,25 @@ export async function sendAction(action: Action): Promise<void> {
   if (res.status === 401) throw new UnauthorizedError((await res.json().catch(() => null))?.error ?? 'Unauthorized');
   if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? `Save failed (${res.status})`);
 }
+
+export interface LinkPreview {
+  url: string;
+  title: string;
+  description: string;
+  image: string;
+  site: string;
+  /** Resized thumbnail as a data URL, so the dialog can show it even when the CDN blocks hotlinking. */
+  imageData: string | null;
+}
+
+export async function fetchPreview(url: string, signal?: AbortSignal): Promise<LinkPreview> {
+  const res = await fetch('/api/preview', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${getEditKey()}` },
+    body: JSON.stringify({ url }),
+    signal,
+  });
+  if (res.status === 401) throw new UnauthorizedError('Edit key needed');
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? `Preview failed (${res.status})`);
+  return res.json();
+}

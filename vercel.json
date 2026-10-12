@@ -1,0 +1,6 @@
+{
+  "functions": {
+    "api/preview.ts": { "maxDuration": 30 },
+    "api/board.ts": { "maxDuration": 30 }
+  }
+}

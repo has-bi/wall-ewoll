@@ -3,6 +3,7 @@ import type { BoardState } from '../src/types.js';
 import type { Action, BookmarkInput } from '../src/lib/board.js';
 import { hostnameOf, normalizeUrl } from '../src/lib/url.js';
 import { createSeed } from '../src/lib/seed.js';
+import { fetchThumbnail } from './thumbs.js';
 
 let client: NeonQueryFunction<false, false> | null = null;
 
@@ -22,7 +23,7 @@ export function setSqlClient(next: NeonQueryFunction<false, false> | null): void
 
 export class BadRequest extends Error {}
 
-const LIMITS = { sectionName: 40, title: 120, note: 500, url: 2048 };
+const LIMITS = { sectionName: 40, title: 120, description: 500, url: 2048 };
 
 function cleanName(name: unknown): string {
   if (typeof name !== 'string' || !name.trim()) throw new BadRequest('Name is required');
@@ -39,15 +40,18 @@ export async function readBoard(): Promise<BoardState> {
   let [categories, sections, bookmarks] = await db.transaction([
     db`SELECT id, name, tagline FROM categories ORDER BY position, id`,
     db`SELECT id, category_id AS "categoryId", name FROM sections ORDER BY position, id`,
-    db`SELECT id, section_id AS "sectionId", title, url, note, image_url AS "imageUrl", created_at AS "createdAt"
-       FROM bookmarks ORDER BY created_at DESC, id`,
+    db`SELECT b.id, b.section_id AS "sectionId", b.title, b.url, b.description, b.image_url AS "imageUrl",
+              b.created_at AS "createdAt",
+              CASE WHEN t.source_url = b.image_url THEN left(md5(t.source_url), 12) END AS thumb
+       FROM bookmarks b LEFT JOIN thumbnails t ON t.bookmark_id = b.id
+       ORDER BY b.created_at DESC, b.id`,
   ]);
   if (categories.length === 0) {
     // First run on an empty database: install the default Wedding + Cafe board.
     await replaceBoard(createSeed());
     return createSeed();
   }
-  bookmarks = bookmarks.map((b) => ({ ...b, createdAt: Number(b.createdAt) }));
+  bookmarks = bookmarks.map(({ thumb, ...b }) => ({ ...b, createdAt: Number(b.createdAt), ...(thumb ? { thumb } : {}) }));
   return { version: 1, categories, sections, bookmarks } as BoardState;
 }
 
@@ -62,10 +66,10 @@ export async function replaceBoard(state: BoardState): Promise<void> {
     db`INSERT INTO sections (id, category_id, name, position)
        SELECT * FROM unnest(${s.map((x) => x.id)}::text[], ${s.map((x) => x.categoryId)}::text[],
                             ${s.map((x) => x.name)}::text[], ${s.map((_, i) => i)}::int[])`,
-    db`INSERT INTO bookmarks (id, section_id, title, url, note, image_url, created_at)
+    db`INSERT INTO bookmarks (id, section_id, title, url, description, image_url, created_at)
        SELECT * FROM unnest(${b.map((x) => x.id)}::text[], ${b.map((x) => x.sectionId)}::text[],
                             ${b.map((x) => x.title)}::text[], ${b.map((x) => x.url)}::text[],
-                            ${b.map((x) => x.note)}::text[], ${b.map((x) => x.imageUrl)}::text[],
+                            ${b.map((x) => x.description)}::text[], ${b.map((x) => x.imageUrl)}::text[],
                             ${b.map((x) => x.createdAt)}::bigint[])`,
   ]);
 }
@@ -120,18 +124,19 @@ export async function applyAction(action: Action): Promise<void> {
       if (!url) throw new BadRequest('Only http(s) links are allowed');
       const sectionId = str(input.sectionId, 'sectionId');
       const title = (typeof input.title === 'string' ? input.title.trim() : '').slice(0, LIMITS.title) || hostnameOf(url);
-      const note = (typeof input.note === 'string' ? input.note.trim() : '').slice(0, LIMITS.note);
+      const description = (typeof input.description === 'string' ? input.description.trim() : '').slice(0, LIMITS.description);
       const imageUrl = typeof input.imageUrl === 'string' ? (normalizeUrl(input.imageUrl.slice(0, LIMITS.url)) ?? '') : '';
       const id = typeof input.id === 'string' && input.id ? input.id : str(action.id, 'id');
       const now = typeof action.now === 'number' && Number.isFinite(action.now) ? Math.trunc(action.now) : Date.now();
       const rows = await db`
-        INSERT INTO bookmarks (id, section_id, title, url, note, image_url, created_at)
-        SELECT ${id}, s.id, ${title}, ${url}, ${note}, ${imageUrl}, ${now} FROM sections s WHERE s.id = ${sectionId}
+        INSERT INTO bookmarks (id, section_id, title, url, description, image_url, created_at)
+        SELECT ${id}, s.id, ${title}, ${url}, ${description}, ${imageUrl}, ${now} FROM sections s WHERE s.id = ${sectionId}
         ON CONFLICT (id) DO UPDATE SET
           section_id = EXCLUDED.section_id, title = EXCLUDED.title, url = EXCLUDED.url,
-          note = EXCLUDED.note, image_url = EXCLUDED.image_url
+          description = EXCLUDED.description, image_url = EXCLUDED.image_url
         RETURNING id`;
       if (rows.length === 0) throw new BadRequest('Unknown section');
+      await syncThumbnail(id, imageUrl);
       return;
     }
     case 'bookmark/delete':
@@ -144,4 +149,32 @@ export async function applyAction(action: Action): Promise<void> {
     default:
       throw new BadRequest('Unknown action');
   }
+}
+
+/** Keeps the cached thumbnail in step with the bookmark's image URL. Failures leave the card on its fallback tile. */
+async function syncThumbnail(bookmarkId: string, imageUrl: string): Promise<void> {
+  const db = sql();
+  if (!imageUrl) {
+    await db`DELETE FROM thumbnails WHERE bookmark_id = ${bookmarkId}`;
+    return;
+  }
+  const [existing] = await db`SELECT source_url FROM thumbnails WHERE bookmark_id = ${bookmarkId}`;
+  if (existing?.source_url === imageUrl) return;
+  try {
+    const thumb = await fetchThumbnail(imageUrl);
+    await db`
+      INSERT INTO thumbnails (bookmark_id, source_url, content_type, data)
+      VALUES (${bookmarkId}, ${imageUrl}, ${thumb.contentType}, decode(${thumb.data.toString('base64')}, 'base64'))
+      ON CONFLICT (bookmark_id) DO UPDATE SET
+        source_url = EXCLUDED.source_url, content_type = EXCLUDED.content_type, data = EXCLUDED.data`;
+  } catch (err) {
+    console.warn(`Thumbnail for ${bookmarkId} failed:`, err instanceof Error ? err.message : err);
+    await db`DELETE FROM thumbnails WHERE bookmark_id = ${bookmarkId}`;
+  }
+}
+
+export async function readThumbnail(bookmarkId: string): Promise<{ contentType: string; data: Buffer } | null> {
+  const [row] = await sql()`
+    SELECT content_type AS "contentType", encode(data, 'base64') AS data FROM thumbnails WHERE bookmark_id = ${bookmarkId}`;
+  return row ? { contentType: row.contentType as string, data: Buffer.from(row.data as string, 'base64') } : null;
 }

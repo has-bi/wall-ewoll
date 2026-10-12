@@ -2,8 +2,8 @@
 import { readFileSync } from 'node:fs';
 import { PGlite } from '@electric-sql/pglite';
 import type { NeonQueryFunction } from '@neondatabase/serverless';
-import { beforeEach, describe, expect, it } from 'vitest';
-import { applyAction, BadRequest, readBoard, setSqlClient } from './db';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { applyAction, BadRequest, readBoard, readThumbnail, setSqlClient } from './db';
 import { createSeed } from '../src/lib/seed';
 import { POST } from '../api/board';
 
@@ -28,6 +28,14 @@ function pgliteNeon(pg: PGlite): NeonQueryFunction<false, false> {
   return sql as unknown as NeonQueryFunction<false, false>;
 }
 
+// No network in tests: any image URL containing "broken" fails, everything else "downloads".
+vi.mock('./thumbs.js', () => ({
+  fetchThumbnail: vi.fn(async (url: string) => {
+    if (url.includes('broken')) throw new Error('404');
+    return { contentType: 'image/webp', data: Buffer.from(`img:${url}`) };
+  }),
+}));
+
 const schema = readFileSync(new URL('../db/schema.sql', import.meta.url), 'utf8');
 
 beforeEach(async () => {
@@ -41,7 +49,7 @@ const save = (input: Record<string, unknown>, id = 'b1') =>
     type: 'bookmark/save',
     id,
     now: 1000,
-    input: { sectionId: 'wedding-s1', title: '', url: 'example.com', note: '', imageUrl: '', ...input },
+    input: { sectionId: 'wedding-s1', title: '', url: 'example.com', description: '', imageUrl: '', ...input },
   } as never);
 
 describe('database', () => {
@@ -54,10 +62,10 @@ describe('database', () => {
   it('saves, edits and deletes bookmarks; newest first', async () => {
     await readBoard();
     await save({ title: 'Old' }, 'a');
-    await applyAction({ type: 'bookmark/save', id: 'b', now: 2000, input: { sectionId: 'wedding-s1', title: 'New', url: 'https://b.com', note: ' hi ', imageUrl: '' } });
+    await applyAction({ type: 'bookmark/save', id: 'b', now: 2000, input: { sectionId: 'wedding-s1', title: 'New', url: 'https://b.com', description: ' hi ', imageUrl: '' } });
     let board = await readBoard();
     expect(board.bookmarks.map((b) => b.title)).toEqual(['New', 'Old']);
-    expect(board.bookmarks[0]).toMatchObject({ url: 'https://b.com/', note: 'hi', createdAt: 2000 });
+    expect(board.bookmarks[0]).toMatchObject({ url: 'https://b.com/', description: 'hi', createdAt: 2000 });
 
     await save({ id: 'a', sectionId: 'wedding-s2', title: 'Moved' }, 'ignored');
     board = await readBoard();
@@ -99,9 +107,57 @@ describe('database', () => {
     await readBoard();
     const next = createSeed();
     next.sections = next.sections.slice(0, 2);
-    next.bookmarks = [{ id: 'i', sectionId: 'wedding-s2', title: 'T', url: 'https://t.com/', note: '', imageUrl: '', createdAt: 5 }];
+    next.bookmarks = [{ id: 'i', sectionId: 'wedding-s2', title: 'T', url: 'https://t.com/', description: '', imageUrl: '', createdAt: 5 }];
     await applyAction({ type: 'board/replace', state: next });
     expect(await readBoard()).toEqual(next);
+  });
+});
+
+describe('thumbnails', () => {
+  it('caches the image on save and exposes a version token', async () => {
+    await readBoard();
+    await save({ imageUrl: 'https://cdn.example.com/a.jpg' });
+    const [b] = (await readBoard()).bookmarks;
+    expect(b.thumb).toMatch(/^[a-f0-9]{12}$/);
+    expect((await readThumbnail('b1'))?.data.toString()).toBe('img:https://cdn.example.com/a.jpg');
+  });
+
+  it('drops a stale thumbnail when the new image cannot be fetched', async () => {
+    await readBoard();
+    await save({ imageUrl: 'https://cdn.example.com/a.jpg' });
+    await save({ id: 'b1', imageUrl: 'https://cdn.example.com/broken.jpg' });
+    const [b] = (await readBoard()).bookmarks;
+    expect(b.imageUrl).toBe('https://cdn.example.com/broken.jpg');
+    expect(b.thumb).toBeUndefined();
+    expect(await readThumbnail('b1')).toBeNull();
+  });
+
+  it('removes the thumbnail when the image is cleared, and with the bookmark', async () => {
+    await readBoard();
+    await save({ imageUrl: 'https://cdn.example.com/a.jpg' });
+    await save({ id: 'b1', imageUrl: '' });
+    expect(await readThumbnail('b1')).toBeNull();
+    await save({ id: 'b1', imageUrl: 'https://cdn.example.com/a.jpg' });
+    await applyAction({ type: 'bookmark/delete', id: 'b1' });
+    expect(await readThumbnail('b1')).toBeNull();
+  });
+});
+
+describe('schema migration', () => {
+  it('renames the v1 "note" column to "description" without losing data', async () => {
+    const old = new PGlite();
+    await old.exec(`
+      CREATE TABLE categories (id text PRIMARY KEY, name text NOT NULL, tagline text NOT NULL DEFAULT '', position integer NOT NULL DEFAULT 0);
+      CREATE TABLE sections (id text PRIMARY KEY, category_id text NOT NULL REFERENCES categories(id) ON DELETE CASCADE, name text NOT NULL, position integer NOT NULL DEFAULT 0);
+      CREATE TABLE bookmarks (id text PRIMARY KEY, section_id text NOT NULL REFERENCES sections(id) ON DELETE CASCADE, title text NOT NULL, url text NOT NULL, note text NOT NULL DEFAULT '', image_url text NOT NULL DEFAULT '', created_at bigint NOT NULL);
+      INSERT INTO categories VALUES ('cafe', 'Cafe', '', 0);
+      INSERT INTO sections VALUES ('s', 'cafe', 'Greeny', 0);
+      INSERT INTO bookmarks VALUES ('x', 's', 'Kopi', 'https://kopi.com/', 'old note', '', 1);`);
+    // Same splitting as scripts/db-setup.ts, run twice to prove it's idempotent.
+    const statements = schema.split(/;\s*$/m).map((s) => s.replace(/^\s*--.*$/gm, '').trim()).filter(Boolean);
+    for (let i = 0; i < 2; i++) for (const st of statements) await old.query(st);
+    setSqlClient(pgliteNeon(old));
+    expect((await readBoard()).bookmarks[0]).toMatchObject({ id: 'x', description: 'old note' });
   });
 });
 

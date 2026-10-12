@@ -10,13 +10,17 @@ export interface Section {
   name: string;
 }
 
+/** Every bookmark is normalised to the same three things on the card: thumbnail, title, description. */
 export interface Bookmark {
   id: string;
   sectionId: string;
   title: string;
   url: string;
-  note: string;
+  description: string;
+  /** Original image URL (og:image, tweet photo, TikTok cover…). Empty when the link has none. */
   imageUrl: string;
+  /** Version token of the server-cached copy of imageUrl; set when /api/thumb can serve it. */
+  thumb?: string;
   createdAt: number;
 }
 
