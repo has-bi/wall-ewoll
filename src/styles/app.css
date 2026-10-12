@@ -513,7 +513,25 @@ select.input { padding-top: 0; padding-bottom: 0; }
   flex-wrap: wrap;
   gap: var(--space-sm);
 }
-.footer__error { color: var(--color-error); }
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+  margin-bottom: var(--space-lg);
+  padding: var(--space-md) var(--space-lg);
+  border-radius: var(--rounded-lg);
+  background: var(--color-brand-ochre);
+  color: var(--color-ink);
+  font-size: 14px;
+  font-weight: 500;
+}
+.banner__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
 
 /* ---------- Modal ---------- */
 .modal {

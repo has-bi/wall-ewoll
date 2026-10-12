@@ -1,4 +1,4 @@
-import type { BoardState, Section } from '../types';
+import type { BoardState, Section } from '../types.js';
 
 const sections = (categoryId: string, names: string[]): Section[] =>
   names.map((name, i) => ({ id: `${categoryId}-s${i + 1}`, categoryId, name }));

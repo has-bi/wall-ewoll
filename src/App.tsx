@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import type { Bookmark, Section } from './types';
-import { boardReducer, newId } from './lib/board';
-import { exportBoard, loadBoard, readBoardFile, saveBoard } from './lib/storage';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import type { BoardState, Bookmark, Section } from './types';
+import { boardReducer, newId, type Action } from './lib/board';
+import { cacheBoard, clearLegacyBoard, exportBoard, loadCachedBoard, loadLegacyBoard, readBoardFile } from './lib/storage';
+import { fetchBoard, getEditKey, sendAction, setEditKey, UnauthorizedError } from './lib/api';
 import { hostnameOf } from './lib/url';
 import { SectionBlock } from './components/SectionBlock';
 import { BookmarkDialog } from './components/BookmarkDialog';
@@ -14,21 +15,40 @@ type DialogState =
   | { kind: 'bookmark'; bookmark?: Bookmark; sectionId: string }
   | { kind: 'section'; section?: Section }
   | { kind: 'delete-section'; section: Section; count: number }
-  | { kind: 'delete-bookmark'; bookmark: Bookmark };
+  | { kind: 'delete-bookmark'; bookmark: Bookmark }
+  | { kind: 'edit-key'; pending: Action; onSuccess?: () => void; error: string };
+
+type SyncStatus = 'loading' | 'online' | 'offline';
 
 const categoryFromHash = () => decodeURIComponent(window.location.hash.replace(/^#\/?/, ''));
 
 export default function App() {
-  const [board, dispatch] = useReducer(boardReducer, undefined, loadBoard);
+  const [board, dispatch] = useReducer(boardReducer, undefined, loadCachedBoard);
+  const [status, setStatus] = useState<SyncStatus>('loading');
+  const [hasKey, setHasKey] = useState(() => !!getEditKey());
+  const [keyDraft, setKeyDraft] = useState('');
+  const [legacy, setLegacy] = useState<BoardState | null>(loadLegacyBoard);
   const [categoryId, setCategoryId] = useState(() => categoryFromHash());
   const [query, setQuery] = useState('');
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [sectionName, setSectionName] = useState('');
-  const [saveFailed, setSaveFailed] = useState(false);
   const [notice, setNotice] = useState('');
   const fileInput = useRef<HTMLInputElement>(null);
 
-  useEffect(() => setSaveFailed(!saveBoard(board)), [board]);
+  useEffect(() => cacheBoard(board), [board]);
+
+  const refresh = useCallback(async () => {
+    try {
+      dispatch({ type: 'board/replace', state: await fetchBoard() });
+      setStatus('online');
+    } catch {
+      setStatus('offline');
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
 
   useEffect(() => {
     const onHash = () => setCategoryId(categoryFromHash());
@@ -60,6 +80,28 @@ export default function App() {
   const flash = (msg: string) => {
     setNotice(msg);
     window.setTimeout(() => setNotice(''), 3000);
+  };
+
+  /** Applies a change locally right away, then saves it. On failure the board is reloaded from the server. */
+  const commit = async (action: Action, onSuccess?: () => void): Promise<void> => {
+    if (status !== 'online') {
+      flash(status === 'loading' ? 'Still loading — try again in a second.' : "Offline — changes can't be saved right now.");
+      return;
+    }
+    dispatch(action);
+    try {
+      await sendAction(action);
+      onSuccess?.();
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        // Retried with the same onSuccess once the user enters the key.
+        setKeyDraft('');
+        setDialog({ kind: 'edit-key', pending: action, onSuccess, error: getEditKey() ? err.message : '' });
+      } else {
+        flash(err instanceof Error ? err.message : 'Save failed.');
+      }
+      void refresh();
+    }
   };
 
   return (
@@ -144,6 +186,51 @@ export default function App() {
           </div>
         </div>
 
+        {status === 'offline' && (
+          <div className="container">
+            <div className="banner" role="status">
+              <span>Can't reach the server. You're seeing the last saved copy.</span>
+              <button type="button" className="btn btn-on-color" onClick={() => void refresh()}>
+                Retry
+              </button>
+            </div>
+          </div>
+        )}
+        {legacy && status === 'online' && board.bookmarks.length === 0 && (
+          <div className="container">
+            <div className="banner" role="status">
+              <span>
+                This browser still has {legacy.bookmarks.length} bookmarks from before the database. Move them in?
+              </span>
+              <span className="banner__actions">
+                <button
+                  type="button"
+                  className="btn btn-on-color"
+                  onClick={() =>
+                    void commit({ type: 'board/replace', state: legacy }, () => {
+                      clearLegacyBoard();
+                      setLegacy(null);
+                      flash('Bookmarks moved to the database.');
+                    })
+                  }
+                >
+                  Move them
+                </button>
+                <button
+                  type="button"
+                  className="btn-text-link"
+                  onClick={() => {
+                    clearLegacyBoard();
+                    setLegacy(null);
+                  }}
+                >
+                  Discard
+                </button>
+              </span>
+            </div>
+          </div>
+        )}
+
         <div className="container sections">
           {sections.map((s, i) => (
             <SectionBlock
@@ -155,7 +242,7 @@ export default function App() {
               filtering={!!q}
               onAdd={() => setDialog({ kind: 'bookmark', sectionId: s.id })}
               onRename={() => openSectionDialog(s)}
-              onMove={(dir) => dispatch({ type: 'section/move', id: s.id, dir })}
+              onMove={(dir) => void commit({ type: 'section/move', id: s.id, dir })}
               onDelete={() =>
                 setDialog({ kind: 'delete-section', section: s, count: board.bookmarks.filter((b) => b.sectionId === s.id).length })
               }
@@ -181,9 +268,10 @@ export default function App() {
           <div>
             <p className="title-sm">Wall Ewoll</p>
             <p className="body-sm">
-              Bookmarks are saved in this browser only. Export a backup to move them to another device.
+              {status === 'offline'
+                ? "Can't reach the server — showing the last copy saved in this browser. Changes are paused."
+                : 'Bookmarks are saved to the database and show up on every device.'}
             </p>
-            {saveFailed && <p className="body-sm footer__error">Couldn't save — browser storage is full or blocked.</p>}
           </div>
           <div className="footer__actions">
             <button type="button" className="btn btn-secondary" onClick={() => exportBoard(board)}>
@@ -192,6 +280,19 @@ export default function App() {
             <button type="button" className="btn btn-secondary" onClick={() => fileInput.current?.click()}>
               Import JSON
             </button>
+            {hasKey && (
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => {
+                  setEditKey('');
+                  setHasKey(false);
+                  flash('Editing locked on this device.');
+                }}
+              >
+                Lock editing
+              </button>
+            )}
             <input
               ref={fileInput}
               type="file"
@@ -203,9 +304,8 @@ export default function App() {
                 if (!file) return;
                 const next = await readBoardFile(file);
                 if (!next) return flash('That file is not a Wall Ewoll backup.');
-                if (window.confirm('Replace all current bookmarks with this backup?')) {
-                  dispatch({ type: 'board/replace', state: next });
-                  flash('Backup imported.');
+                if (window.confirm('Replace everything in the database with this backup?')) {
+                  void commit({ type: 'board/replace', state: next }, () => flash('Backup imported.'));
                 }
               }}
             />
@@ -226,7 +326,7 @@ export default function App() {
           defaultSectionId={dialog.sectionId}
           onClose={close}
           onSave={(input) => {
-            dispatch({ type: 'bookmark/save', input, id: newId(), now: Date.now() });
+            void commit({ type: 'bookmark/save', input, id: newId(), now: Date.now() });
             close();
           }}
         />
@@ -239,8 +339,8 @@ export default function App() {
           submitDisabled={!sectionName.trim()}
           onClose={close}
           onSubmit={() => {
-            if (dialog.section) dispatch({ type: 'section/rename', id: dialog.section.id, name: sectionName });
-            else dispatch({ type: 'section/add', categoryId: category.id, name: sectionName, id: newId() });
+            if (dialog.section) void commit({ type: 'section/rename', id: dialog.section.id, name: sectionName });
+            else void commit({ type: 'section/add', categoryId: category.id, name: sectionName, id: newId() });
             close();
           }}
         >
@@ -265,7 +365,7 @@ export default function App() {
           danger
           onClose={close}
           onSubmit={() => {
-            dispatch({ type: 'section/delete', id: dialog.section.id });
+            void commit({ type: 'section/delete', id: dialog.section.id });
             close();
           }}
         >
@@ -277,6 +377,40 @@ export default function App() {
         </Modal>
       )}
 
+      {dialog.kind === 'edit-key' && (
+        <Modal
+          title="Enter edit key"
+          submitLabel="Unlock & save"
+          submitDisabled={!keyDraft.trim()}
+          onClose={close}
+          onSubmit={() => {
+            setEditKey(keyDraft.trim());
+            setHasKey(true);
+            const { pending, onSuccess } = dialog;
+            close();
+            void commit(pending, onSuccess);
+          }}
+        >
+          <p className="body-md">
+            Anyone can view this wall, but changes need the edit key (the <code>WALL_EDIT_KEY</code> set in Vercel).
+            It's remembered on this device.
+          </p>
+          <label className="field">
+            <span className="field__label">Edit key</span>
+            <input
+              className="input"
+              type="password"
+              value={keyDraft}
+              onChange={(e) => setKeyDraft(e.target.value)}
+              autoComplete="current-password"
+              autoFocus
+              aria-invalid={!!dialog.error}
+            />
+            {dialog.error && <span className="field__error">{dialog.error}</span>}
+          </label>
+        </Modal>
+      )}
+
       {dialog.kind === 'delete-bookmark' && (
         <Modal
           title="Delete bookmark?"
@@ -284,7 +418,7 @@ export default function App() {
           danger
           onClose={close}
           onSubmit={() => {
-            dispatch({ type: 'bookmark/delete', id: dialog.bookmark.id });
+            void commit({ type: 'bookmark/delete', id: dialog.bookmark.id });
             close();
           }}
         >

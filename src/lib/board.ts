@@ -1,5 +1,5 @@
-import type { BoardState, Bookmark, Section } from '../types';
-import { hostnameOf, normalizeUrl } from './url';
+import type { BoardState, Bookmark, Section } from '../types.js';
+import { hostnameOf, normalizeUrl } from './url.js';
 
 export type BookmarkInput = Omit<Bookmark, 'id' | 'createdAt'> & { id?: string };
 

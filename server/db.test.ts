@@ -1,0 +1,129 @@
+// @vitest-environment node
+import { readFileSync } from 'node:fs';
+import { PGlite } from '@electric-sql/pglite';
+import type { NeonQueryFunction } from '@neondatabase/serverless';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { applyAction, BadRequest, readBoard, setSqlClient } from './db';
+import { createSeed } from '../src/lib/seed';
+import { POST } from '../api/board';
+
+/** Minimal stand-in for neon(): lazy tagged-template queries, .query(), and .transaction([...]). */
+function pgliteNeon(pg: PGlite): NeonQueryFunction<false, false> {
+  type Q = PromiseLike<unknown[]> & { text: string; params: unknown[] };
+  const run = async (text: string, params: unknown[]) => (await pg.query(text, params)).rows;
+  const make = (text: string, params: unknown[]): Q => ({
+    text,
+    params,
+    then: (ok, fail) => run(text, params).then(ok, fail),
+  });
+  const sql = (strings: TemplateStringsArray, ...values: unknown[]) =>
+    make(strings.reduce((acc, s, i) => `${acc}$${i}${s}`), values);
+  sql.query = (text: string, params: unknown[] = []) => make(text, params);
+  sql.transaction = async (queries: Q[]) =>
+    pg.transaction(async (tx) => {
+      const out = [];
+      for (const q of queries) out.push((await tx.query(q.text, q.params)).rows);
+      return out;
+    });
+  return sql as unknown as NeonQueryFunction<false, false>;
+}
+
+const schema = readFileSync(new URL('../db/schema.sql', import.meta.url), 'utf8');
+
+beforeEach(async () => {
+  const pg = new PGlite();
+  await pg.exec(schema);
+  setSqlClient(pgliteNeon(pg));
+});
+
+const save = (input: Record<string, unknown>, id = 'b1') =>
+  applyAction({
+    type: 'bookmark/save',
+    id,
+    now: 1000,
+    input: { sectionId: 'wedding-s1', title: '', url: 'example.com', note: '', imageUrl: '', ...input },
+  } as never);
+
+describe('database', () => {
+  it('seeds Wedding and Cafe on first read', async () => {
+    const board = await readBoard();
+    expect(board).toEqual(createSeed());
+    expect(await readBoard()).toEqual(createSeed());
+  });
+
+  it('saves, edits and deletes bookmarks; newest first', async () => {
+    await readBoard();
+    await save({ title: 'Old' }, 'a');
+    await applyAction({ type: 'bookmark/save', id: 'b', now: 2000, input: { sectionId: 'wedding-s1', title: 'New', url: 'https://b.com', note: ' hi ', imageUrl: '' } });
+    let board = await readBoard();
+    expect(board.bookmarks.map((b) => b.title)).toEqual(['New', 'Old']);
+    expect(board.bookmarks[0]).toMatchObject({ url: 'https://b.com/', note: 'hi', createdAt: 2000 });
+
+    await save({ id: 'a', sectionId: 'wedding-s2', title: 'Moved' }, 'ignored');
+    board = await readBoard();
+    expect(board.bookmarks.find((b) => b.id === 'a')).toMatchObject({ sectionId: 'wedding-s2', title: 'Moved', createdAt: 1000 });
+    expect(board.bookmarks).toHaveLength(2);
+
+    await applyAction({ type: 'bookmark/delete', id: 'a' });
+    expect((await readBoard()).bookmarks.map((b) => b.id)).toEqual(['b']);
+  });
+
+  it('rejects unsafe urls and unknown sections', async () => {
+    await readBoard();
+    await expect(save({ url: 'javascript:alert(1)' })).rejects.toBeInstanceOf(BadRequest);
+    await expect(save({ sectionId: 'ghost' })).rejects.toBeInstanceOf(BadRequest);
+  });
+
+  it('adds, renames, moves and deletes sections; delete cascades', async () => {
+    await readBoard();
+    await applyAction({ type: 'section/add', categoryId: 'wedding', name: '  Catering ', id: 'x' });
+    await expect(applyAction({ type: 'section/add', categoryId: 'nope', name: 'A', id: 'y' })).rejects.toBeInstanceOf(BadRequest);
+    await applyAction({ type: 'section/rename', id: 'x', name: 'Food' });
+    await applyAction({ type: 'section/move', id: 'x', dir: -1 });
+    let names = (await readBoard()).sections.filter((s) => s.categoryId === 'wedding').map((s) => s.name);
+    expect(names).toEqual(['Place', 'Wedding Organizer', 'Food', 'Decorations']);
+
+    // Moving the first section up is a no-op.
+    await applyAction({ type: 'section/move', id: 'wedding-s1', dir: -1 });
+    names = (await readBoard()).sections.filter((s) => s.categoryId === 'wedding').map((s) => s.name);
+    expect(names[0]).toBe('Place');
+
+    await save({ sectionId: 'x' });
+    await applyAction({ type: 'section/delete', id: 'x' });
+    const board = await readBoard();
+    expect(board.sections.some((s) => s.id === 'x')).toBe(false);
+    expect(board.bookmarks).toHaveLength(0);
+  });
+
+  it('replaces the whole board (import)', async () => {
+    await readBoard();
+    const next = createSeed();
+    next.sections = next.sections.slice(0, 2);
+    next.bookmarks = [{ id: 'i', sectionId: 'wedding-s2', title: 'T', url: 'https://t.com/', note: '', imageUrl: '', createdAt: 5 }];
+    await applyAction({ type: 'board/replace', state: next });
+    expect(await readBoard()).toEqual(next);
+  });
+});
+
+describe('POST /api/board auth', () => {
+  const post = (key?: string) =>
+    POST(
+      new Request('http://x/api/board', {
+        method: 'POST',
+        headers: key ? { authorization: `Bearer ${key}` } : {},
+        body: JSON.stringify({ type: 'bookmark/delete', id: 'nothing' }),
+      }),
+    );
+
+  it('refuses writes when no key is configured', async () => {
+    delete process.env.WALL_EDIT_KEY;
+    expect((await post('anything')).status).toBe(401);
+  });
+
+  it('checks the bearer key', async () => {
+    process.env.WALL_EDIT_KEY = 'secret';
+    expect((await post()).status).toBe(401);
+    expect((await post('wrong')).status).toBe(401);
+    expect((await post('secret')).status).toBe(200);
+  });
+});
