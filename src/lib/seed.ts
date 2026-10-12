@@ -7,8 +7,8 @@ export function createSeed(): BoardState {
   return {
     version: 1,
     categories: [
-      { id: 'wedding', name: 'Wedding', tagline: 'Venues, vendors and little details for the big day.' },
-      { id: 'cafe', name: 'Cafe', tagline: 'Spots worth the trip — to work, to chill, or just for cake.' },
+      { id: 'wedding', name: 'Wedding', tagline: 'Venues, vendors and little details for the big day.', icon: 'ring' },
+      { id: 'cafe', name: 'Cafe', tagline: 'Spots worth the trip — to work, to chill, or just for cake.', icon: 'cup' },
     ],
     sections: [
       ...sections('wedding', ['Place', 'Wedding Organizer', 'Decorations']),

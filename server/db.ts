@@ -1,6 +1,6 @@
 import { neon, type NeonQueryFunction } from '@neondatabase/serverless';
 import type { BoardState } from '../src/types.js';
-import type { Action, BookmarkInput } from '../src/lib/board.js';
+import { isCategoryIcon, type Action, type BookmarkInput, type CategoryInput } from '../src/lib/board.js';
 import { hostnameOf, normalizeUrl } from '../src/lib/url.js';
 import { createSeed } from '../src/lib/seed.js';
 import { fetchThumbnail } from './thumbs.js';
@@ -23,11 +23,27 @@ export function setSqlClient(next: NeonQueryFunction<false, false> | null): void
 
 export class BadRequest extends Error {}
 
-const LIMITS = { sectionName: 40, title: 120, description: 500, url: 2048 };
+const LIMITS = { categoryName: 30, tagline: 120, sectionName: 40, title: 120, description: 500, url: 2048 };
 
 function cleanName(name: unknown): string {
   if (typeof name !== 'string' || !name.trim()) throw new BadRequest('Name is required');
   return name.trim().slice(0, LIMITS.sectionName);
+}
+
+function cleanCategory(input: Partial<CategoryInput> | undefined): CategoryInput {
+  const name = typeof input?.name === 'string' ? input.name.trim().slice(0, LIMITS.categoryName) : '';
+  if (!name) throw new BadRequest('Name is required');
+  return {
+    name,
+    tagline: typeof input?.tagline === 'string' ? input.tagline.trim().slice(0, LIMITS.tagline) : '',
+    icon: isCategoryIcon(input?.icon) ? input.icon : 'grid',
+  };
+}
+
+function categoryId(v: unknown): string {
+  // Category ids appear in URLs (#/road-trip), so keep them to a safe alphabet.
+  if (typeof v !== 'string' || !/^[\w-]{1,64}$/.test(v)) throw new BadRequest('Invalid category id');
+  return v;
 }
 
 function str(v: unknown, field: string): string {
@@ -38,7 +54,7 @@ function str(v: unknown, field: string): string {
 export async function readBoard(): Promise<BoardState> {
   const db = sql();
   let [categories, sections, bookmarks] = await db.transaction([
-    db`SELECT id, name, tagline FROM categories ORDER BY position, id`,
+    db`SELECT id, name, tagline, icon FROM categories ORDER BY position, id`,
     db`SELECT id, category_id AS "categoryId", name FROM sections ORDER BY position, id`,
     db`SELECT b.id, b.section_id AS "sectionId", b.title, b.url, b.description, b.image_url AS "imageUrl",
               b.created_at AS "createdAt",
@@ -60,9 +76,9 @@ export async function replaceBoard(state: BoardState): Promise<void> {
   const { categories: c, sections: s, bookmarks: b } = state;
   await db.transaction([
     db`DELETE FROM categories`,
-    db`INSERT INTO categories (id, name, tagline, position)
+    db`INSERT INTO categories (id, name, tagline, icon, position)
        SELECT * FROM unnest(${c.map((x) => x.id)}::text[], ${c.map((x) => x.name)}::text[],
-                            ${c.map((x) => x.tagline)}::text[], ${c.map((_, i) => i)}::int[])`,
+                            ${c.map((x) => x.tagline)}::text[], ${c.map((x) => x.icon)}::text[], ${c.map((_, i) => i)}::int[])`,
     db`INSERT INTO sections (id, category_id, name, position)
        SELECT * FROM unnest(${s.map((x) => x.id)}::text[], ${s.map((x) => x.categoryId)}::text[],
                             ${s.map((x) => x.name)}::text[], ${s.map((_, i) => i)}::int[])`,
@@ -81,6 +97,47 @@ export async function replaceBoard(state: BoardState): Promise<void> {
 export async function applyAction(action: Action): Promise<void> {
   const db = sql();
   switch (action.type) {
+    case 'category/add': {
+      const { name, tagline, icon } = cleanCategory(action.input);
+      const rows = await db`
+        INSERT INTO categories (id, name, tagline, icon, position)
+        VALUES (${categoryId(action.id)}, ${name}, ${tagline}, ${icon},
+                COALESCE((SELECT MAX(position) + 1 FROM categories), 0))
+        ON CONFLICT (id) DO NOTHING
+        RETURNING id`;
+      if (rows.length === 0) throw new BadRequest('A category with that id already exists');
+      return;
+    }
+    case 'category/update': {
+      const { name, tagline, icon } = cleanCategory(action.input);
+      await db`UPDATE categories SET name = ${name}, tagline = ${tagline}, icon = ${icon} WHERE id = ${categoryId(action.id)}`;
+      return;
+    }
+    case 'category/move': {
+      if (action.dir !== 1 && action.dir !== -1) throw new BadRequest('dir must be 1 or -1');
+      const id = categoryId(action.id);
+      // Same approach as sections: normalise to 0..n-1, then swap with the neighbour.
+      await db.transaction([
+        db`UPDATE categories c SET position = r.rn
+           FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY position, id) - 1 AS rn FROM categories) r
+           WHERE c.id = r.id`,
+        db`UPDATE categories c SET position = CASE WHEN c.id = ${id} THEN me.position + ${action.dir} ELSE me.position END
+           FROM (SELECT position FROM categories WHERE id = ${id}) me
+           WHERE (c.id = ${id} OR c.position = me.position + ${action.dir})
+             AND EXISTS (SELECT 1 FROM categories n WHERE n.position = me.position + ${action.dir})`,
+      ]);
+      return;
+    }
+    case 'category/delete': {
+      const id = categoryId(action.id);
+      // Sections, bookmarks and thumbnails go with it (ON DELETE CASCADE). Never delete the last one.
+      const rows = await db`DELETE FROM categories WHERE id = ${id} AND (SELECT count(*) FROM categories) > 1 RETURNING id`;
+      if (rows.length === 0) {
+        const [{ n }] = await db`SELECT count(*)::int AS n FROM categories WHERE id = ${id}`;
+        if (n) throw new BadRequest("Can't delete the last category");
+      }
+      return;
+    }
     case 'section/add': {
       const name = cleanName(action.name);
       const id = str(action.id, 'id');

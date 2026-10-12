@@ -2,6 +2,8 @@ export interface Category {
   id: string;
   name: string;
   tagline: string;
+  /** One of CATEGORY_ICONS; empty means the generic grid icon. */
+  icon: string;
 }
 
 export interface Section {

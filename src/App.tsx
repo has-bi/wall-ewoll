@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import type { BoardState, Bookmark, Section } from './types';
-import { boardReducer, newId, type Action } from './lib/board';
+import type { BoardState, Bookmark, Category, Section } from './types';
+import { boardReducer, categoryIdFor, isCategoryIcon, newId, type Action } from './lib/board';
 import { cacheBoard, clearLegacyBoard, exportBoard, loadCachedBoard, loadLegacyBoard, readBoardFile } from './lib/storage';
 import { fetchBoard, fetchPreview, getEditKey, sendAction, setEditKey, UnauthorizedError } from './lib/api';
 import { hostnameOf } from './lib/url';
 import { BookmarkDialog } from './components/BookmarkDialog';
+import { CategoryDialog } from './components/CategoryDialog';
 import { Masonry, PinCard } from './components/PinCard';
 import { Modal } from './components/Modal';
 import { Icon, type IconName } from './components/Icon';
@@ -15,6 +16,9 @@ type DialogState =
   | { kind: 'section'; section?: Section }
   | { kind: 'delete-section'; section: Section; count: number }
   | { kind: 'delete-bookmark'; bookmark: Bookmark }
+  | { kind: 'categories' }
+  | { kind: 'category'; category?: Category }
+  | { kind: 'delete-category'; category: Category; sections: number; bookmarks: number }
   /** `then` runs once a key has been entered: a retried save, or opening the add dialog. */
   | { kind: 'edit-key'; then: () => void; error: string };
 
@@ -28,7 +32,10 @@ const readHash = () => {
 const hrefFor = (categoryId: string, sectionId?: string) =>
   `#/${encodeURIComponent(categoryId)}${sectionId ? `/${encodeURIComponent(sectionId)}` : ''}`;
 
-const CATEGORY_ICONS: Record<string, IconName> = { wedding: 'ring', cafe: 'cup' };
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const iconFor = (c: Category): IconName => (isCategoryIcon(c.icon) ? c.icon : 'grid');
+// Bottom nav fits 4 categories around the + button; beyond that the last slot opens the full list.
+const NAV_SLOTS = 4;
 
 export default function App() {
   const [board, dispatch] = useReducer(boardReducer, undefined, loadCachedBoard);
@@ -167,13 +174,32 @@ export default function App() {
       flash(failed ? `Done — ${failed} link${failed === 1 ? '' : 's'} couldn't be read.` : 'Previews updated.');
     });
 
-  const half = Math.ceil(board.categories.length / 2);
-  const navItem = (c: (typeof board.categories)[number]) => (
-    <a key={c.id} href={hrefFor(c.id)} className={`bottom-nav__item${c.id === category.id ? ' is-active' : ''}`} aria-current={c.id === category.id ? 'page' : undefined}>
-      <Icon name={CATEGORY_ICONS[c.id] ?? 'grid'} size={22} />
-      <span>{c.name}</span>
-    </a>
-  );
+  const bookmarksIn = (categoryId: string) => {
+    const ids = new Set(board.sections.filter((s) => s.categoryId === categoryId).map((s) => s.id));
+    return board.bookmarks.filter((b) => ids.has(b.sectionId)).length;
+  };
+
+  // Keep the active category visible in the bottom nav even when it's past the first slots.
+  const overflow = board.categories.length > NAV_SLOTS;
+  let navCategories = overflow ? board.categories.slice(0, NAV_SLOTS - 1) : board.categories;
+  if (overflow && !navCategories.includes(category)) navCategories = [...navCategories.slice(0, -1), category];
+  const navItems = [
+    ...navCategories.map((c) => (
+      <a key={c.id} href={hrefFor(c.id)} className={`bottom-nav__item${c.id === category.id ? ' is-active' : ''}`} aria-current={c.id === category.id ? 'page' : undefined}>
+        <Icon name={iconFor(c)} size={22} />
+        <span>{c.name}</span>
+      </a>
+    )),
+    ...(overflow
+      ? [
+          <button key="more" type="button" className="bottom-nav__item" onClick={() => setDialog({ kind: 'categories' })}>
+            <Icon name="grid" size={22} />
+            <span>More</span>
+          </button>,
+        ]
+      : []),
+  ];
+  const half = Math.ceil(navItems.length / 2);
 
   return (
     <>
@@ -183,15 +209,19 @@ export default function App() {
             <span className="brand__mark" aria-hidden="true" />
             <span className="brand__name">Wall Ewoll</span>
           </a>
-          <p className="app-header__title" aria-hidden="true">
+          <button type="button" className="app-header__title" onClick={() => setDialog({ kind: 'categories' })} aria-label={`${category.name} — switch category`}>
             {category.name}
-          </p>
+            <Icon name="chevron" size={16} />
+          </button>
           <nav className="cat-pills" aria-label="Categories">
             {board.categories.map((c) => (
               <a key={c.id} href={hrefFor(c.id)} className={c.id === category.id ? 'category-tab category-tab--active' : 'category-tab'} aria-current={c.id === category.id ? 'page' : undefined}>
                 {c.name}
               </a>
             ))}
+            <button type="button" className="category-tab category-tab--add" onClick={() => setDialog({ kind: 'category' })} aria-label="New category">
+              <Icon name="plus" size={16} />
+            </button>
           </nav>
           <div className="app-header__actions">
             <button
@@ -228,7 +258,12 @@ export default function App() {
 
       <main className="container main">
         <div className="page-head">
-          <h1 className="display-md">{category.name}</h1>
+          <div className="page-head__title">
+            <h1 className="display-md">{category.name}</h1>
+            <button type="button" className="icon-btn" onClick={() => setDialog({ kind: 'category', category })} aria-label={`Edit ${category.name}`}>
+              <Icon name="edit" size={18} />
+            </button>
+          </div>
           <p className="body-md muted">{category.tagline}</p>
         </div>
 
@@ -248,9 +283,7 @@ export default function App() {
 
         <div className="section-bar">
           <p className="caption-uppercase muted">
-            {activeSection
-              ? `${counts.get(activeSection.id) ?? 0} ${(counts.get(activeSection.id) ?? 0) === 1 ? 'link' : 'links'}`
-              : `${totalInCategory} links · ${sections.length} sections`}
+            {activeSection ? plural(counts.get(activeSection.id) ?? 0, 'link') : `${plural(totalInCategory, 'link')} · ${plural(sections.length, 'section')}`}
             {q && ` · ${visible.length} match${visible.length === 1 ? '' : 'es'}`}
           </p>
           {activeSection && (
@@ -323,6 +356,15 @@ export default function App() {
             )}
           />
         ) : (
+          sections.length === 0 ? (
+          <div className="empty-state">
+            <h2 className="display-sm">Start with a section</h2>
+            <p className="body-md">Sections are the tabs inside {category.name} — like “Place” and “Decorations” in Wedding.</p>
+            <button type="button" className="btn btn-primary" onClick={() => openSectionDialog()}>
+              <Icon name="plus" size={16} /> New section
+            </button>
+          </div>
+          ) : (
           <div className="empty-state">
             <h2 className="display-sm">{q ? 'No matches' : 'Nothing saved here yet'}</h2>
             <p className="body-md">
@@ -334,6 +376,7 @@ export default function App() {
               </button>
             )}
           </div>
+          )
         )}
       </main>
 
@@ -393,11 +436,11 @@ export default function App() {
       </footer>
 
       <nav className="bottom-nav" aria-label="Categories">
-        {board.categories.slice(0, half).map(navItem)}
+        {navItems.slice(0, half)}
         <button type="button" className="fab" onClick={openAdd} aria-label="Add bookmark">
           <Icon name="plus" size={24} />
         </button>
-        {board.categories.slice(half).map(navItem)}
+        {navItems.slice(half)}
       </nav>
 
       {notice && (
@@ -503,6 +546,86 @@ export default function App() {
             />
             {dialog.error && <span className="field__error">{dialog.error}</span>}
           </label>
+        </Modal>
+      )}
+
+      {dialog.kind === 'categories' && (
+        <Modal title="Categories" submitLabel="New category" cancelLabel="Close" onClose={close} onSubmit={() => setDialog({ kind: 'category' })}>
+          <ul className="category-list">
+            {board.categories.map((c, i) => (
+              <li key={c.id} className={`category-list__row${c.id === category.id ? ' is-active' : ''}`}>
+                <a href={hrefFor(c.id)} className="category-list__link" onClick={close}>
+                  <span className="category-list__icon">
+                    <Icon name={iconFor(c)} size={20} />
+                  </span>
+                  <span className="category-list__name">
+                    <span className="title-sm">{c.name}</span>
+                    <span className="caption muted">{plural(bookmarksIn(c.id), 'link')}</span>
+                  </span>
+                  {c.id === category.id && <Icon name="check" size={18} />}
+                </a>
+                <span className="category-list__tools">
+                  <button type="button" className="icon-btn" onClick={() => void commit({ type: 'category/move', id: c.id, dir: -1 })} disabled={i === 0} aria-label={`Move ${c.name} up`}>
+                    <Icon name="up" size={16} />
+                  </button>
+                  <button type="button" className="icon-btn" onClick={() => void commit({ type: 'category/move', id: c.id, dir: 1 })} disabled={i === board.categories.length - 1} aria-label={`Move ${c.name} down`}>
+                    <Icon name="down" size={16} />
+                  </button>
+                  <button type="button" className="icon-btn" onClick={() => setDialog({ kind: 'category', category: c })} aria-label={`Edit ${c.name}`}>
+                    <Icon name="edit" size={16} />
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </Modal>
+      )}
+
+      {dialog.kind === 'category' && (
+        <CategoryDialog
+          initial={dialog.category}
+          canDelete={board.categories.length > 1}
+          onClose={close}
+          onDelete={() => {
+            const c = dialog.category!;
+            setDialog({
+              kind: 'delete-category',
+              category: c,
+              sections: board.sections.filter((s) => s.categoryId === c.id).length,
+              bookmarks: bookmarksIn(c.id),
+            });
+          }}
+          onSave={(input) => {
+            if (dialog.category) {
+              void commit({ type: 'category/update', id: dialog.category.id, input });
+            } else {
+              const id = categoryIdFor(input.name, board.categories.map((c) => c.id));
+              void commit({ type: 'category/add', id, input });
+              window.location.hash = hrefFor(id);
+            }
+            close();
+          }}
+        />
+      )}
+
+      {dialog.kind === 'delete-category' && (
+        <Modal
+          title={`Delete “${dialog.category.name}”?`}
+          submitLabel="Delete category"
+          danger
+          onClose={close}
+          onSubmit={() => {
+            const next = board.categories.find((c) => c.id !== dialog.category.id);
+            void commit({ type: 'category/delete', id: dialog.category.id });
+            if (next) window.location.hash = hrefFor(next.id);
+            close();
+          }}
+        >
+          <p className="body-md">
+            {dialog.sections + dialog.bookmarks > 0
+              ? `Its ${dialog.sections} ${dialog.sections === 1 ? 'section' : 'sections'} and ${dialog.bookmarks} ${dialog.bookmarks === 1 ? 'bookmark' : 'bookmarks'} will be deleted too. This can't be undone — export a backup first if you might want them back.`
+              : 'This category is empty.'}
+          </p>
         </Modal>
       )}
 

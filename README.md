@@ -27,7 +27,9 @@ npm test                     # reducer, URL validation, SQL (in-process Postgres
 
 ## Features
 
-- Category tabs (Wedding, Cafe), sections as tabs inside each category, masonry card grid, floating "+" on mobile
+- Categories: Wedding and Cafe to start; add, rename, pick an icon, reorder or delete more any time
+  (mobile: tap the title or "More"; desktop: the + next to the category tabs)
+- Sections as tabs inside each category, masonry card grid, floating "+" on mobile
 - Every bookmark is normalised to **thumbnail + title + short description** (clamped with "…"),
   whatever the link is: Instagram, Threads, Facebook, TikTok, X/Twitter, YouTube, Google Maps or any article
 - Paste a link and the card fills itself in; every field can still be edited by hand

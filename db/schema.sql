@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS categories (
   id       text PRIMARY KEY,
   name     text NOT NULL,
   tagline  text NOT NULL DEFAULT '',
+  icon     text NOT NULL DEFAULT '',
   position integer NOT NULL DEFAULT 0
 );
 
@@ -29,6 +30,12 @@ CREATE INDEX IF NOT EXISTS bookmarks_section_idx ON bookmarks (section_id, creat
 
 -- v2: the free-text "note" became the card description.
 DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookmarks' AND column_name = 'note') THEN ALTER TABLE bookmarks RENAME COLUMN note TO description; END IF; END $$;
+
+-- v3: categories pick an icon for the bottom nav.
+ALTER TABLE categories ADD COLUMN IF NOT EXISTS icon text NOT NULL DEFAULT '';
+UPDATE categories SET icon = 'ring' WHERE id = 'wedding' AND icon = '';
+UPDATE categories SET icon = 'cup' WHERE id = 'cafe' AND icon = '';
+UPDATE categories SET icon = 'grid' WHERE icon = '';
 
 -- Server-side copy of each bookmark's image, resized to WebP. Platform image URLs
 -- (Instagram, TikTok, X) are signed and expire, so cards can't rely on them.

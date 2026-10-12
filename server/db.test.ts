@@ -113,6 +113,37 @@ describe('database', () => {
   });
 });
 
+describe('categories', () => {
+  it('adds, updates, reorders and deletes categories', async () => {
+    await readBoard();
+    await applyAction({ type: 'category/add', id: 'road-trip', input: { name: 'Road Trip', tagline: 'Weekend drives', icon: 'plane' } });
+    await expect(applyAction({ type: 'category/add', id: 'road-trip', input: { name: 'Again', tagline: '', icon: 'grid' } })).rejects.toBeInstanceOf(BadRequest);
+    await expect(applyAction({ type: 'category/add', id: 'bad id!', input: { name: 'X', tagline: '', icon: 'grid' } })).rejects.toBeInstanceOf(BadRequest);
+    await expect(applyAction({ type: 'category/add', id: 'empty', input: { name: '  ', tagline: '', icon: 'grid' } })).rejects.toBeInstanceOf(BadRequest);
+    await applyAction({ type: 'category/update', id: 'road-trip', input: { name: 'Trips', tagline: '', icon: '<script>' } });
+    await applyAction({ type: 'category/move', id: 'road-trip', dir: -1 });
+    let board = await readBoard();
+    expect(board.categories.map((c) => c.id)).toEqual(['wedding', 'road-trip', 'cafe']);
+    expect(board.categories[1]).toEqual({ id: 'road-trip', name: 'Trips', tagline: '', icon: 'grid' });
+
+    await applyAction({ type: 'section/add', categoryId: 'road-trip', name: 'Bali', id: 'bali' });
+    await save({ sectionId: 'bali', imageUrl: 'https://cdn.example.com/bali.jpg' });
+    await applyAction({ type: 'category/delete', id: 'road-trip' });
+    board = await readBoard();
+    expect(board.categories.map((c) => c.id)).toEqual(['wedding', 'cafe']);
+    expect(board.sections.some((s) => s.id === 'bali')).toBe(false);
+    expect(board.bookmarks).toHaveLength(0);
+    expect(await readThumbnail('b1')).toBeNull();
+  });
+
+  it('refuses to delete the last category', async () => {
+    await readBoard();
+    await applyAction({ type: 'category/delete', id: 'cafe' });
+    await expect(applyAction({ type: 'category/delete', id: 'wedding' })).rejects.toThrow(/last category/);
+    expect((await readBoard()).categories.map((c) => c.id)).toEqual(['wedding']);
+  });
+});
+
 describe('thumbnails', () => {
   it('caches the image on save and exposes a version token', async () => {
     await readBoard();
@@ -157,7 +188,9 @@ describe('schema migration', () => {
     const statements = schema.split(/;\s*$/m).map((s) => s.replace(/^\s*--.*$/gm, '').trim()).filter(Boolean);
     for (let i = 0; i < 2; i++) for (const st of statements) await old.query(st);
     setSqlClient(pgliteNeon(old));
-    expect((await readBoard()).bookmarks[0]).toMatchObject({ id: 'x', description: 'old note' });
+    const board = await readBoard();
+    expect(board.bookmarks[0]).toMatchObject({ id: 'x', description: 'old note' });
+    expect(board.categories[0]).toMatchObject({ id: 'cafe', icon: 'cup' });
   });
 });
 

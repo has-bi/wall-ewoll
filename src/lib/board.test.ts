@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boardReducer, parseBoard, type BookmarkInput } from './board';
+import { boardReducer, categoryIdFor, parseBoard, type BookmarkInput } from './board';
 import { createSeed } from './seed';
 import { normalizeUrl } from './url';
 
@@ -73,6 +73,48 @@ describe('boardReducer', () => {
     expect(wedding).toEqual(['Place', 'Wedding Organizer', 'Catering', 'Decorations']);
     const first = s.sections.find((x) => x.categoryId === 'cafe')!;
     expect(boardReducer(s, { type: 'section/move', id: first.id, dir: -1 })).toBe(s);
+  });
+});
+
+describe('categories', () => {
+  const add = (state = createSeed(), name = 'Road Trip', id = 'road-trip') =>
+    boardReducer(state, { type: 'category/add', id, input: { name, tagline: ' Weekend drives ', icon: 'plane' } });
+
+  it('makes URL-safe unique ids', () => {
+    expect(categoryIdFor('Road Trip!', ['wedding'])).toBe('road-trip');
+    expect(categoryIdFor('Cafe', ['wedding', 'cafe', 'cafe-2'])).toBe('cafe-3');
+    expect(categoryIdFor('💍', [])).toBe('category');
+  });
+
+  it('adds, updates and validates', () => {
+    let s = add();
+    expect(s.categories.at(-1)).toEqual({ id: 'road-trip', name: 'Road Trip', tagline: 'Weekend drives', icon: 'plane' });
+    expect(add(s)).toBe(s); // duplicate id
+    expect(add(createSeed(), '   ')).toEqual(createSeed());
+    s = boardReducer(s, { type: 'category/update', id: 'road-trip', input: { name: 'Trips', tagline: '', icon: 'not-an-icon' } });
+    expect(s.categories.at(-1)).toMatchObject({ name: 'Trips', icon: 'grid' });
+  });
+
+  it('reorders', () => {
+    const s = boardReducer(add(), { type: 'category/move', id: 'road-trip', dir: -1 });
+    expect(s.categories.map((c) => c.id)).toEqual(['wedding', 'road-trip', 'cafe']);
+    expect(boardReducer(s, { type: 'category/move', id: 'wedding', dir: -1 })).toBe(s);
+  });
+
+  it('deletes with its sections and bookmarks, but never the last one', () => {
+    let s = save(createSeed(), { sectionId: 'cafe-s1' });
+    s = boardReducer(s, { type: 'category/delete', id: 'cafe' });
+    expect(s.categories.map((c) => c.id)).toEqual(['wedding']);
+    expect(s.sections.every((x) => x.categoryId === 'wedding')).toBe(true);
+    expect(s.bookmarks).toHaveLength(0);
+    expect(boardReducer(s, { type: 'category/delete', id: 'wedding' })).toBe(s);
+  });
+
+  it('gives icons to categories from older backups', () => {
+    const old = createSeed() as unknown as { categories: Record<string, unknown>[] };
+    old.categories = old.categories.map(({ icon: _icon, ...c }) => c);
+    old.categories.push({ id: 'misc', name: 'Misc', tagline: '' });
+    expect(parseBoard(old)?.categories.map((c) => c.icon)).toEqual(['ring', 'cup', 'grid']);
   });
 });
 
